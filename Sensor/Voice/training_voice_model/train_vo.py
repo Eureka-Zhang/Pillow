@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import argparse
 import wandb
-from model_MLT import CNN_TCN_MTL
+from model_vo import CNN_TCN_MTL
 
 '''
 # 需先安装: pip install wandb，并 wandb login

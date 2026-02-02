@@ -174,7 +174,7 @@ class PyTorchBackend(InferenceBackend):
     def __init__(self, model_path, config):
         super().__init__(model_path, config)
         import torch
-        from model_MLT import CNN_TCN_MTL
+        from model_vo import CNN_TCN_MTL
         
         self.torch = torch
         self.device = torch.device("cpu")

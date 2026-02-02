@@ -28,10 +28,13 @@ class TCNBlock(nn.Module):
 
 
 # =========================
-# CNN + TCN + Dual Head
+# CNN + TCN + Dual Head（与 train_vo 一致：睡姿 5 类）
 # =========================
+NUM_POSTURE_CLASSES = 5
+
+
 class CNN_TCN_MTL(nn.Module):
-    def __init__(self, snore_classes = 2, posture_classes=6):
+    def __init__(self, snore_classes=2, posture_classes=NUM_POSTURE_CLASSES):
         super().__init__()
 
         # -------- CNN --------
@@ -89,9 +92,10 @@ def count_parameters(model):
 # ONNX 导出
 # =========================
 if __name__ == "__main__":
-    model = CNN_TCN_MTL(posture_classes=6)
+    model = CNN_TCN_MTL(snore_classes=2, posture_classes=NUM_POSTURE_CLASSES)
     model.eval()
 
+    # 输入形状 [B, 1, F, T]，按实际特征尺寸修改
     dummy_input = torch.randn(1, 1, 64, 300)
 
     torch.onnx.export(
@@ -100,7 +104,7 @@ if __name__ == "__main__":
         "cnn_tcn_mtl.onnx",
         input_names=["input"],
         output_names=["snore_logits", "posture_logits"],
-        opset_version=11
+        opset_version=11,
     )
 
     print("✅ Model converted to ONNX and saved as cnn_tcn_mtl.onnx")
