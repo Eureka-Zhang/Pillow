@@ -1,0 +1,3 @@
+# 气囊控制器 PC端依赖
+pyserial>=3.5
+pynput>=1.7.6
