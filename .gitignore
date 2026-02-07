@@ -1,0 +1,61 @@
+# --- Flutter (App) ---
+App/pillow_app/build/
+App/pillow_app/.dart_tool/
+App/pillow_app/.flutter-plugins
+App/pillow_app/.flutter-plugins-dependencies
+App/pillow_app/.pub-cache/
+App/pillow_app/.packages
+App/pillow_app/pubspec.lock
+App/pillow_app/android/local.properties
+App/pillow_app/ios/.generated/
+App/pillow_app/linux/flutter/ephemeral/
+# 忽略 Flutter 生成的平台工程文件（如果你希望只保留源码）
+# App/pillow_app/android/
+# App/pillow_app/ios/
+# App/pillow_app/linux/
+
+# --- Python (Sensor / Actuator) ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+ENV/
+env/
+
+# --- Arduino (Actuator) ---
+*.hex
+*.elf
+*.bin
+*.d
+*.o
+
+# --- IDE & System ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+*.log
+*.rknn
