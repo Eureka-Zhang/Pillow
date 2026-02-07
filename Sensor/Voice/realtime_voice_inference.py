@@ -21,7 +21,7 @@ Usage:
     python3 realtime_inference.py --model_path ./mlt_best.pth
     
     # RKNN NPU 推理 (推荐，速度更快)
-    python3 realtime_inference.py --model_path ./model.rknn --backend rknn
+     python3 Sensor/Voice/realtime_voice_inference.py --model_path Sensor/Voice/voice_model.rknn --backend rknn
     
     # 列出音频设备
     python3 realtime_inference.py --list_devices
@@ -73,6 +73,7 @@ class Config:
     
     # Detection thresholds
     SNORE_THRESHOLD = 0.5        # 打鼾判定阈值
+    SILENCE_THRESHOLD = 0.008     # 静音门限 (低于此值视为底噪，不推理)
 
 
 # =====================
@@ -236,12 +237,28 @@ class RKNNBackend(InferenceBackend):
     
     def predict(self, mel_input):
         # RKNN 输入需要是 numpy array
-        # 输入形状: [1, 1, 80, 301] (NCHW)
         mel_input = mel_input.astype(np.float32)
         
-        # RKNN 推理
-        outputs = self.rknn.inference(inputs=[mel_input])
+        outputs = None
+        # 尝试 1: 原始 4 维输入 (1, 1, 80, 301)
+        try:
+            outputs = self.rknn.inference(inputs=[mel_input])
+        except Exception:
+            outputs = None
+            
+        # 如果 4D 失败（抛异常 或 返回None），尝试 3D
+        if outputs is None:
+            # print(f"[WARN] 4D input failed, trying 3D input (1, 80, 301)...")
+            try:
+                mel_input_3d = np.squeeze(mel_input, axis=1) # 去掉 channel 维 -> (1, 80, 301)
+                outputs = self.rknn.inference(inputs=[mel_input_3d])
+            except Exception:
+                outputs = None
         
+        if outputs is None:
+            # 彻底失败，返回默认值
+            return np.array([[1.0, 0.0]]), np.array([[1.0, 0.0, 0.0, 0.0, 0.0]])
+
         # outputs[0]: snore_logits [1, 2]
         # outputs[1]: posture_logits [1, 5]
         snore_logits = outputs[0]
@@ -297,8 +314,11 @@ class RealtimeSnoreDetector:
         if status:
             print(f"[WARN] Audio status: {status}")
         
-        # 获取单声道数据
-        audio_data = indata[:, 0] if indata.ndim > 1 else indata.flatten()
+        # 立体声转单声道 (取平均)
+        if indata.ndim > 1 and indata.shape[1] >= 2:
+            audio_data = np.mean(indata, axis=1).astype(np.float32)
+        else:
+            audio_data = indata.flatten().astype(np.float32)
         
         with self.buffer_lock:
             # 滑动缓冲区：移除旧数据，添加新数据
@@ -345,6 +365,24 @@ class RealtimeSnoreDetector:
         2. normalize_for_inference: 推理前再次标准化 (与训练时一致)
         3. 模型推理
         """
+        # 计算音频电平 (用于调试)
+        audio_rms = np.sqrt(np.mean(audio ** 2))
+        audio_peak = np.max(np.abs(audio))
+        
+        # 静音检测：底噪低于阈值时，直接返回"正常"，跳过模型推理
+        if audio_rms < self.config.SILENCE_THRESHOLD:
+            return {
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "is_snoring": False,
+                "snore_confidence": 0.0,
+                "snore_probs": np.array([1.0, 0.0]),
+                "posture_pred": 0,
+                "posture_probs": np.array([1.0, 0.0, 0.0, 0.0, 0.0]),
+                "audio_rms": float(audio_rms),
+                "audio_peak": float(audio_peak),
+                "is_silent": True
+            }
+        
         # Step 1: 提取Mel频谱 (与 MEL_preprocess.py 一致)
         mel = extract_mel_spectrogram(audio, self.config)
         
@@ -357,21 +395,32 @@ class RealtimeSnoreDetector:
         # Step 4: 模型推理
         snore_logits, posture_logits = self.backend.predict(mel_input)
         
+        # 调试: 打印原始 logits (每10次打印一次)
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        self._debug_count += 1
+        if self._debug_count % 10 == 1:
+            print(f"\n[DEBUG] snore_logits: {snore_logits[0]}, posture_logits: {posture_logits[0][:3]}...")
+        
         # Step 5: 计算概率 (softmax)
         snore_probs = self._softmax(snore_logits[0])
         posture_probs = self._softmax(posture_logits[0])
         
-        # 获取预测结果
-        snore_pred = np.argmax(snore_probs)
+        # 打鼾判定：打鼾概率大于 SNORE_THRESHOLD(0.5) 才判为打鼾
+        snore_confidence = float(snore_probs[1])
+        is_snoring = snore_confidence > self.config.SNORE_THRESHOLD
         posture_pred = np.argmax(posture_probs)
         
         return {
             "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "is_snoring": snore_pred == 1,
-            "snore_confidence": float(snore_probs[1]),  # P(snoring)
+            "is_snoring": is_snoring,
+            "snore_confidence": snore_confidence,  # P(snoring)
             "snore_probs": snore_probs,                 # [P(non-snore), P(snore)]
             "posture_pred": int(posture_pred),
-            "posture_probs": posture_probs              # 5类睡姿概率
+            "posture_probs": posture_probs,             # 5类睡姿概率
+            "audio_rms": float(audio_rms),              # 音频 RMS 电平
+            "audio_peak": float(audio_peak),            # 音频峰值
+            "is_silent": False
         }
     
     @staticmethod
@@ -384,25 +433,27 @@ class RealtimeSnoreDetector:
         """打印检测结果"""
         timestamp = result["timestamp"]
         is_snoring = result["is_snoring"]
-        snore_conf = result["snore_confidence"]
+        snore_probs = result["snore_probs"]
         inference_ms = result.get("inference_time_ms", 0)
+        audio_rms = result.get("audio_rms", 0)
+        is_silent = result.get("is_silent", False)
+        
+        # 音量条 (可视化)
+        vol_bar_len = int(min(audio_rms * 100, 20))
+        vol_bar = "█" * vol_bar_len + "░" * (20 - vol_bar_len)
         
         # 清空当前行并打印
-        print("\r" + " " * 140, end="\r")
+        print("\r" + " " * 120, end="\r")
         
-        if is_snoring:
-            posture_probs = result["posture_probs"]
-            posture_pred = result["posture_pred"]
-            posture_label = self.posture_labels.get(posture_pred, f"Unknown({posture_pred})")
-            
-            # 格式化睡姿概率向量
-            probs_str = ", ".join([f"{p:.2f}" for p in posture_probs])
-            
-            print(f"[{timestamp}] 🔴 打鼾 ({snore_conf:.0%}) | "
-                  f"{posture_label} | "
-                  f"[{probs_str}] | {inference_ms:.0f}ms")
+        if is_silent:
+            # 静音/底噪状态
+            print(f"[{timestamp}] ⚪ 静音 | 音量:{audio_rms:.4f} [{vol_bar}] (阈值:{self.config.SILENCE_THRESHOLD})")
+        elif is_snoring:
+            snore_probs_str = f"[正常:{snore_probs[0]:.2f}, 打鼾:{snore_probs[1]:.2f}]"
+            print(f"[{timestamp}] 🔴 打鼾 {snore_probs_str} | 音量:{audio_rms:.4f} [{vol_bar}] | {inference_ms:.0f}ms")
         else:
-            print(f"[{timestamp}] 🟢 正常 ({1-snore_conf:.0%}) | {inference_ms:.0f}ms", end="")
+            snore_probs_str = f"[正常:{snore_probs[0]:.2f}, 打鼾:{snore_probs[1]:.2f}]"
+            print(f"[{timestamp}] 🟢 正常 {snore_probs_str} | 音量:{audio_rms:.4f} [{vol_bar}] | {inference_ms:.0f}ms")
     
     def start(self, device_id=None):
         """开始实时检测"""
@@ -412,15 +463,16 @@ class RealtimeSnoreDetector:
         
         self.is_running = True
         
-        # 配置音频流参数
+        # 配置音频流参数 (es8388 使用双通道)
         stream_params = {
             "samplerate": self.config.SAMPLE_RATE,
-            "channels": 1,
+            "channels": 2,  # 双通道 (es8388)
             "dtype": np.float32,
             "blocksize": int(self.config.SAMPLE_RATE * 0.1),  # 100ms块
             "callback": self._audio_callback
         }
         
+        # 指定设备 (使用设备索引号)
         if device_id is not None:
             stream_params["device"] = device_id
         
