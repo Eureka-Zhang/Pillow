@@ -80,26 +80,32 @@ class PressureInference:
         """
         if self.rknn is None:
             return 0, [0.9, 0.1, 0.0, 0.0, 0.0]
-        
-        # 尝试扩展为 4 维: (1, 1, 4, 256)
-        # input_data is (4, 256)
-        input_tensor = input_data[np.newaxis, np.newaxis, :, :]  # -> (1, 1, 4, 256)
-        input_tensor = input_tensor.astype(np.float32)
-        
-        try:
-            outputs = self.rknn.inference(inputs=[input_tensor])
-        except Exception as e:
-            # 备选：尝试 (1, 4, 256, 1)
+
+        input_data = input_data.astype(np.float32)
+        outputs = None
+        size_warned = getattr(self, "_input_size_warned", False)
+
+        # 压力模型导出时为 (1, 4, 256)，对应 4096 字节。若报 96320 则当前 .rknn 是语音模型形状。
+        for tensor in [
+            input_data[np.newaxis, :, :],           # (1, 4, 256)
+            input_data[np.newaxis, np.newaxis, :, :],  # (1, 1, 4, 256)
+            input_data.reshape(1, -1),              # (1, 1024)
+        ]:
             try:
-                # print("[WARN] Retrying with shape (1, 4, 256, 1)...")
-                input_tensor = input_data[np.newaxis, :, :, np.newaxis]
-                input_tensor = input_tensor.astype(np.float32)
-                outputs = self.rknn.inference(inputs=[input_tensor])
-            except Exception:
-                outputs = None
+                outputs = self.rknn.inference(inputs=[tensor])
+                break
+            except Exception as e:
+                err_str = str(e)
+                if not size_warned and ("96320" in err_str or "24080" in err_str):
+                    self._input_size_warned = True
+                    print(
+                        "[WARN] 当前 .rknn 期望输入约 96320 字节(24080 维)，为语音模型 (1,80,301)。"
+                        "压力模型应为 (1,4,256)=4096 字节。请用 pressure 的 ONNX 按 scripts/onnx2rknn.py 重新导出 pressure_model.rknn。"
+                    )
+                continue
 
         if outputs is None:
-            return 0, [0.0]*5
+            return 0, [0.0] * 5
         
         # 解析输出
         logits = outputs[0][0]  # (5,)
@@ -180,21 +186,28 @@ def inference_thread_func(model_path):
 # =====================
 # 串口解析逻辑 (复用)
 # =====================
+# 与 serial_loop 一致：单包 516 字节 = 3 包头 + 512 数据(256×int16) + 1 尾字节(未用)
+PACKET_SIZE = 516
+HEADER = (0xAA, 0xAB, 0xAC)
+
+
 def process_packet(packet):
     global latest_pressure_matrix
-    
-    if packet[0] != 0xAA or packet[1] != 0xAB or packet[2] != 0xAC:
+
+    if len(packet) != PACKET_SIZE:
+        return
+    if packet[0] != HEADER[0] or packet[1] != HEADER[1] or packet[2] != HEADER[2]:
         return
 
-    data_bytes = packet[3:-1]
+    data_bytes = packet[3:515]  # 512 字节，不含最后一字节（校验/保留）
     try:
-        values = struct.unpack('<256h', data_bytes)
-        arr = np.array(values)
+        # 小端无符号 int16，压力值通常 >= 0
+        values = struct.unpack("<256H", data_bytes)
+        arr = np.array(values, dtype=np.float32)
         matrix = arr.reshape(16, 16)
-        
         with matrix_lock:
             latest_pressure_matrix = matrix
-    except Exception:
+    except struct.error:
         pass
 
 def serial_loop(port, baudrate):
@@ -204,8 +217,6 @@ def serial_loop(port, baudrate):
         print(f"[Serial] Opened {port} @ {baudrate}")
         
         buffer = bytearray()
-        PACKET_SIZE = 516
-        
         while running:
             if ser.in_waiting:
                 buffer.extend(ser.read(ser.in_waiting))
