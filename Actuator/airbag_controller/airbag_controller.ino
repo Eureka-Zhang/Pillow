@@ -75,6 +75,13 @@ void loop() {
     int airbag = airbagChar - '0';
     int level = durationChar - '0';
     
+    // 停止命令优先处理（兼容 S00 等，后两字节忽略）
+    if (cmd == 'S' || cmd == 's') {
+      stopAllOperations();
+      Serial.println("OK:All operations stopped");
+      return;
+    }
+    
     // 验证参数
     if (airbag < 1 || airbag > 4) {
       Serial.println("ERR:Invalid airbag number (1-4)");
@@ -93,10 +100,6 @@ void loop() {
     } else if (cmd == 'V' || cmd == 'v') {
       // 放气命令
       startDeflate(airbag, level);
-    } else if (cmd == 'S' || cmd == 's') {
-      // 停止命令
-      stopAllOperations();
-      Serial.println("OK:All operations stopped");
     } else {
       Serial.println("ERR:Unknown command");
     }

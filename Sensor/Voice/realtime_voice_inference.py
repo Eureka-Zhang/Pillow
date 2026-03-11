@@ -18,13 +18,13 @@ Mel频谱处理流程 (与训练时一致):
 
 Usage:
     # PyTorch CPU 推理
-    python3 realtime_inference.py --model_path ./mlt_best.pth
+    python3 realtime_voice_inference.py --model_path ./mlt_best.pth
     
     # RKNN NPU 推理 (推荐，速度更快)
      python3 Sensor/Voice/realtime_voice_inference.py --model_path Sensor/Voice/voice_model.rknn --backend rknn
     
     # 列出音频设备
-    python3 realtime_inference.py --list_devices
+    python3 realtime_voice_inference.py --list_devices
     
     # 测试麦克风
     python3 realtime_inference.py --test_audio
@@ -261,8 +261,48 @@ class RKNNBackend(InferenceBackend):
 
         # outputs[0]: snore_logits [1, 2]
         # outputs[1]: posture_logits [1, 5]
-        snore_logits = outputs[0]
-        posture_logits = outputs[1]
+        
+        snore_logits = None
+        posture_logits = None
+        
+        if len(outputs) == 2:
+            # 自动检测输出顺序 (根据 shape)
+            out0 = outputs[0]
+            out1 = outputs[1]
+            
+            # snore: [1, 2], posture: [1, 5]
+            if out0.shape[-1] == 2 and out1.shape[-1] == 5:
+                snore_logits = out0
+                posture_logits = out1
+            elif out0.shape[-1] == 5 and out1.shape[-1] == 2:
+                # print("[WARN] Model outputs swapped, auto-correcting...")
+                posture_logits = out0
+                snore_logits = out1
+            else:
+                # 无法判断或形状不对，按默认顺序
+                snore_logits = out0
+                posture_logits = out1
+        elif len(outputs) == 1:
+            # print(f"[WARN] Model returned 1 output instead of 2. Trying to infer...")
+            out = outputs[0]
+            if out.shape[-1] == 2:
+                snore_logits = out
+                posture_logits = np.zeros((1, 5)) # Dummy posture
+                print("[WARN] Model only returned Snore Logits. Posture detection disabled.")
+            elif out.shape[-1] == 5:
+                posture_logits = out
+                snore_logits = np.zeros((1, 2)) # Dummy snore
+                snore_logits[0, 0] = 1.0 # Default to non-snore
+                print("[WARN] Model only returned Posture Logits. Snore detection disabled.")
+            else:
+                print(f"[ERROR] Unknown output shape: {out.shape}")
+                # Return dummy values if shape is unknown
+                snore_logits = np.array([[1.0, 0.0]])
+                posture_logits = np.array([[1.0, 0.0, 0.0, 0.0, 0.0]])
+        else:
+             print(f"[ERROR] Expected 1 or 2 outputs, got {len(outputs)}")
+             snore_logits = np.array([[1.0, 0.0]])
+             posture_logits = np.array([[1.0, 0.0, 0.0, 0.0, 0.0]])
         
         return snore_logits, posture_logits
     
@@ -434,9 +474,16 @@ class RealtimeSnoreDetector:
         timestamp = result["timestamp"]
         is_snoring = result["is_snoring"]
         snore_probs = result["snore_probs"]
+        posture_pred = result.get("posture_pred", 0)
+        posture_probs = result.get("posture_probs", np.zeros(5))
         inference_ms = result.get("inference_time_ms", 0)
         audio_rms = result.get("audio_rms", 0)
         is_silent = result.get("is_silent", False)
+        
+        # 获取睡姿名称
+        posture_name = self.posture_labels.get(posture_pred, "Unknown")
+        # 简化的睡姿名称用于显示
+        simple_posture_name = posture_name.split('(')[0].strip()
         
         # 音量条 (可视化)
         vol_bar_len = int(min(audio_rms * 100, 20))
@@ -447,13 +494,15 @@ class RealtimeSnoreDetector:
         
         if is_silent:
             # 静音/底噪状态
-            print(f"[{timestamp}] ⚪ 静音 | 音量:{audio_rms:.4f} [{vol_bar}] (阈值:{self.config.SILENCE_THRESHOLD})")
+            print(f"[{timestamp}] ⚪ 静音 | 音量:{audio_rms:.4f} [{vol_bar}]")
         elif is_snoring:
-            snore_probs_str = f"[正常:{snore_probs[0]:.2f}, 打鼾:{snore_probs[1]:.2f}]"
-            print(f"[{timestamp}] 🔴 打鼾 {snore_probs_str} | 音量:{audio_rms:.4f} [{vol_bar}] | {inference_ms:.0f}ms")
+            snore_conf = snore_probs[1]
+            posture_conf = posture_probs[posture_pred]
+            print(f"[{timestamp}] 🔴 打鼾 ({snore_conf:.2f}) | 睡姿: {simple_posture_name} ({posture_conf:.2f}) | 音量:{audio_rms:.4f} [{vol_bar}] | {inference_ms:.0f}ms")
         else:
-            snore_probs_str = f"[正常:{snore_probs[0]:.2f}, 打鼾:{snore_probs[1]:.2f}]"
-            print(f"[{timestamp}] 🟢 正常 {snore_probs_str} | 音量:{audio_rms:.4f} [{vol_bar}] | {inference_ms:.0f}ms")
+            snore_conf = snore_probs[0] # 正常的置信度
+            posture_conf = posture_probs[posture_pred]
+            print(f"[{timestamp}] 🟢 正常 ({snore_conf:.2f}) |  音量:{audio_rms:.4f} [{vol_bar}] | {inference_ms:.0f}ms")
     
     def start(self, device_id=None):
         """开始实时检测"""
