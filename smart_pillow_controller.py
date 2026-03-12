@@ -65,6 +65,11 @@ class SleepStats:
     reset_count: int = 0
     command_count: int = 0
     alarms: List[str] = field(default_factory=list)
+    # 数据统计（由 realtime 脚本写入文件，STOP_SLEEP 时合并）
+    total_sleep_sec: float = 0.0
+    snoring_total_sec: float = 0.0
+    snoring_posture_ratio: Dict[str, float] = field(default_factory=dict)
+    sleep_score: int = 0
 
     def to_report_line(self) -> str:
         payload = {
@@ -77,6 +82,10 @@ class SleepStats:
             "reset_count": self.reset_count,
             "command_count": self.command_count,
             "alarms": self.alarms,
+            "total_sleep_sec": round(self.total_sleep_sec, 1),
+            "snoring_total_sec": round(self.snoring_total_sec, 1),
+            "snoring_posture_ratio": self.snoring_posture_ratio,
+            "sleep_score": self.sleep_score,
         }
         return "SLEEP_REPORT:" + json.dumps(payload, ensure_ascii=False)
 
@@ -91,6 +100,8 @@ class ArduinoBridge:
         self._ser: Optional[serial.Serial] = None
         self._port: Optional[str] = None
         self._lock = threading.Lock()
+        self._reader_stop = threading.Event()
+        self._reader_thread: Optional[threading.Thread] = None
 
     @property
     def current_port(self) -> Optional[str]:
@@ -105,13 +116,45 @@ class ArduinoBridge:
             return False
         return self.connect(port)
 
+    def _read_serial_to_stdout(self) -> None:
+        """后台线程：将 Arduino 串口输出转发到终端，便于查看下游状态。"""
+        buffer = ""
+        while not self._reader_stop.is_set():
+            ser = self._ser
+            if not ser or not ser.is_open:
+                break
+            try:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                buffer += raw.decode("utf-8", errors="replace")
+                while "\n" in buffer or "\r" in buffer:
+                    sep = "\n" if "\n" in buffer else "\r"
+                    i = buffer.index(sep)
+                    line = buffer[:i].strip()
+                    buffer = buffer[i + 1 :].lstrip("\r\n")
+                    if line:
+                        print("[Arduino]", line, flush=True)
+            except (OSError, serial.SerialException, TypeError, AttributeError):
+                # 关闭串口时 fd 可能已为 None，readline 会抛 TypeError/AttributeError，属正常退出
+                break
+            except Exception:
+                LOG.exception("Arduino 串口读取异常")
+
     def connect(self, port: str) -> bool:
         try:
+            self._reader_stop.clear()
             self._ser = serial.Serial(port, self.baudrate, timeout=0.2)
             self._port = port
-            time.sleep(1.2)
+            # 打开串口会触发 Arduino 复位，需等其 boot + setup() 完成后再发指令
+            time.sleep(2.0)
+            self._wait_arduino_ready(timeout=4.0)
             self._ser.reset_input_buffer()
             self._ser.reset_output_buffer()
+            self._reader_thread = threading.Thread(
+                target=self._read_serial_to_stdout, name="ArduinoReader", daemon=True
+            )
+            self._reader_thread.start()
             LOG.info("Arduino 已连接: %s", port)
             return True
         except serial.SerialException as exc:
@@ -120,12 +163,35 @@ class ArduinoBridge:
             self._port = None
             return False
 
+    def _wait_arduino_ready(self, timeout: float = 4.0) -> None:
+        """等 Arduino 打印就绪信息（如 'Airbag Controller Ready'）后再返回，避免首条指令在初始化时丢失。"""
+        if not self._ser or not self._ser.is_open:
+            return
+        deadline = time.monotonic() + timeout
+        buf = ""
+        while time.monotonic() < deadline:
+            raw = self._ser.readline()
+            if not raw:
+                time.sleep(0.05)
+                continue
+            buf += raw.decode("utf-8", errors="replace")
+            if "Ready" in buf or "ready" in buf:
+                LOG.debug("Arduino 已就绪")
+                return
+            if len(buf) > 512:
+                buf = buf[-256:]
+        LOG.debug("Arduino 就绪等待超时，继续")
+
     def disconnect(self) -> None:
+        self._reader_stop.set()
         with self._lock:
             if self._ser and self._ser.is_open:
                 self._ser.close()
             self._ser = None
             self._port = None
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=1.0)
+        self._reader_thread = None
 
     def send_wire(self, cmd: str) -> None:
         """发送 3 字节命令，如 P11、V21、S00。"""
@@ -184,7 +250,7 @@ class ArduinoBridge:
 
 
 class SleepModeManager:
-    """睡眠模式：启动压力监测子进程，根据姿态结果自动调节气囊。"""
+    """睡眠模式：启动「实时打鼾与睡姿监控」脚本，融合压力+语音并自动止鼾。"""
 
     def __init__(self, project_root: Path, arduino: ArduinoBridge):
         self.project_root = project_root
@@ -192,36 +258,24 @@ class SleepModeManager:
         self.stats = SleepStats()
         self.running = False
         self._lock = threading.Lock()
-        self._worker: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._pressure_proc: Optional[subprocess.Popen] = None
-        self._pressure_reader: Optional[threading.Thread] = None
-        self._last_auto_ts = 0.0
-        self._cooldown_sec = 8.0
+        self._control_proc: Optional[subprocess.Popen] = None
 
     def start(self) -> None:
         with self._lock:
             if self.running:
                 return
             self.running = True
-            self._stop_event.clear()
             self.stats = SleepStats(started_at=now_str())
-            self._start_pressure_process()
-            self._worker = threading.Thread(target=self._auto_loop, daemon=True)
-            self._worker.start()
-            LOG.info("睡眠模式已启动")
+            self._start_snore_posture_control()
+            LOG.info("睡眠模式已启动（打鼾+睡姿融合监控）")
 
     def stop(self) -> SleepStats:
         with self._lock:
             if not self.running:
                 return self.stats
             self.running = False
-            self._stop_event.set()
 
-        if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=2)
-
-        self._stop_pressure_process()
+        self._stop_snore_posture_control()
         self.stats.ended_at = now_str()
         if self.stats.started_at:
             try:
@@ -230,91 +284,72 @@ class SleepModeManager:
                 self.stats.duration_sec = int((end - start).total_seconds())
             except ValueError:
                 pass
+        # 合并 realtime 脚本写入的睡眠统计（总时长、打鼾时长、打鼾时睡姿占比、睡眠评分）
+        stats_file = self.project_root / "sleep_session_stats.json"
+        if stats_file.exists():
+            try:
+                data = json.loads(stats_file.read_text(encoding="utf-8"))
+                self.stats.total_sleep_sec = float(data.get("total_sleep_sec", 0))
+                self.stats.snoring_total_sec = float(data.get("snoring_total_sec", 0))
+                self.stats.snoring_posture_ratio = dict(data.get("snoring_posture_ratio", {}))
+                self.stats.sleep_score = int(data.get("sleep_score", 0))
+            except Exception as e:
+                LOG.warning("读取睡眠统计文件失败: %s", e)
         LOG.info("睡眠模式已停止")
         return self.stats
 
     def record_alarm(self, alarm: str) -> None:
         self.stats.alarms.append(alarm)
 
-    def _auto_loop(self) -> None:
-        """占位循环，实际触发由 _pressure_reader_loop 解析压力输出完成。"""
-        while not self._stop_event.is_set():
-            time.sleep(1.0)
-
-    def _start_pressure_process(self) -> None:
-        script = self.project_root / "Sensor" / "Pressure" / "realtime_pressure_inference.py"
-        if not script.exists():
-            LOG.warning("压力监测脚本不存在: %s", script)
+    def _start_snore_posture_control(self) -> None:
+        """启动 realtime_snore_posture_control.py（压力+语音融合，自动止鼾）。"""
+        control_script = self.project_root / "realtime_snore_posture_control.py"
+        if not control_script.exists():
+            LOG.warning("打鼾睡姿监控脚本不存在: %s", control_script)
             return
-
-        port = self._detect_pressure_port(exclude=self.arduino.current_port)
-        if not port:
-            LOG.warning("未检测到压力传感器串口，跳过压力监测")
+        if not self.arduino.connect_auto():
+            LOG.error("无法连接 Arduino，无法启动监控")
             return
-
-        cmd = ["python3", str(script), "--port", port]
-        self._pressure_proc = subprocess.Popen(
+        arduino_port = self.arduino.current_port
+        self.arduino.disconnect()
+        pressure_port = self._detect_pressure_port(exclude=arduino_port) or "/dev/ttyUSB0"
+        if pressure_port == "/dev/ttyUSB0" and not self._detect_pressure_port(exclude=arduino_port):
+            LOG.warning("未检测到压力传感器串口，使用默认 %s", pressure_port)
+        cmd = [
+            "python3",
+            str(control_script),
+            "--arduino-port", arduino_port or "",
+            "--pressure-port", pressure_port,
+            "--project-root", str(self.project_root),
+        ]
+        self._control_proc = subprocess.Popen(
             cmd,
             cwd=str(self.project_root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            stdin=subprocess.DEVNULL,
+            stdout=None,
+            stderr=None,
         )
-        LOG.info("压力监测已启动: %s (pid=%s)", port, self._pressure_proc.pid)
-        self._pressure_reader = threading.Thread(target=self._pressure_reader_loop, daemon=True)
-        self._pressure_reader.start()
+        LOG.info("打鼾睡姿监控已启动 pid=%s，日志输出到当前终端", self._control_proc.pid)
 
-    def _stop_pressure_process(self) -> None:
-        if not self._pressure_proc:
+    def _stop_snore_posture_control(self) -> None:
+        if not self._control_proc:
             return
-        if self._pressure_proc.poll() is None:
-            self._pressure_proc.terminate()
+        if self._control_proc.poll() is None:
+            self._control_proc.terminate()
             try:
-                self._pressure_proc.wait(timeout=2)
+                self._control_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                self._pressure_proc.kill()
-        self._pressure_proc = None
-        self._pressure_reader = None
+                self._control_proc.kill()
+        self._control_proc = None
 
     def _detect_pressure_port(self, exclude: Optional[str]) -> Optional[str]:
         ports = list(serial.tools.list_ports.comports())
-        devices = [p.device for p in ports if p.device != exclude]
-        return devices[0] if devices else None
-
-    def _pressure_reader_loop(self) -> None:
-        proc = self._pressure_proc
-        if not proc or not proc.stdout:
-            return
-
-        for line in proc.stdout:
-            if self._stop_event.is_set():
-                break
-            text = line.strip()
-            if "[Result]" not in text:
-                continue
-
-            target_zone: Optional[str] = None
-            if "Left" in text:
-                target_zone = "R2"
-            elif "Right" in text:
-                target_zone = "L2"
-
-            if not target_zone:
-                continue
-
-            now = time.time()
-            if now - self._last_auto_ts < self._cooldown_sec:
-                continue
-
-            try:
-                self.arduino.pillow_adjust("PILLOW_UP", target_zone)
-                self.stats.snore_events += 1
-                self.stats.auto_adjust_events += 1
-                self._last_auto_ts = now
-                LOG.info("自动调节 (%s) -> %s", text[:40], target_zone)
-            except Exception:
-                LOG.exception("自动调节发送失败")
+        for p in ports:
+            t = f"{p.device} {p.description}".lower()
+            if "ttyusb" in t or "ch340" in t or "ch341" in t:
+                if p.device != exclude:
+                    return p.device
+        return next((p.device for p in ports if p.device != exclude), None)
 
 
 class SmartPillowController:

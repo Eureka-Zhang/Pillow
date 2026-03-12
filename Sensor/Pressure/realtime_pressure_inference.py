@@ -23,9 +23,9 @@ class Config:
     SERIAL_PORT = "/dev/ttyUSB0"
     BAUDRATE = 115200
     
-    # 采样设置
-    SAMPLE_INTERVAL = 0.25  # 250ms
-    BATCH_SIZE = 4          # 4帧一组 (1秒)
+    # 采样设置（模型输入固定 4 帧；延迟主要来自攒够 4 帧才推理，串口本身非阻塞）
+    SAMPLE_INTERVAL = 0.2   # 200ms 采一帧，4 帧约 0.8s 输出一次
+    BATCH_SIZE = 4          # 模型输入 (1,4,256)，必须 4 帧
     
     # 数据预处理
     NORM_SCALE = 4095.0     # 归一化分母 (根据传感器量程调整，假设12bit)
@@ -155,7 +155,7 @@ def inference_thread_func(model_path):
                 # 简单策略：重复上一帧
                 buffer.append(buffer[-1])
         
-        # 2. 攒够 4 帧 -> 推理
+        # 2. 攒够 4 帧 -> 推理（模型输入固定 (1,4,256)）
         if len(buffer) == Config.BATCH_SIZE:
             # 拼接 -> (4, 256)
             input_batch = np.array(buffer, dtype=np.float32)
@@ -211,6 +211,7 @@ def process_packet(packet):
         pass
 
 def serial_loop(port, baudrate):
+    """串口读循环：非阻塞（仅读 in_waiting），不阻塞推理线程。"""
     global running
     try:
         ser = serial.Serial(port, baudrate, timeout=0.1)

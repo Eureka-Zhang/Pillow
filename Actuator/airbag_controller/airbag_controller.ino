@@ -31,97 +31,112 @@ const int VALVE_PINS[4] = {2, 3, 4, 5};   // valve1, valve2, valve3, valve4
 const unsigned long INFLATE_TIMES[2] = {5000, 10000};   // 充气：5秒, 10秒
 const unsigned long DEFLATE_TIMES[2] = {10000, 15000};  // 放气：10秒, 15秒
 
-// 操作状态
-unsigned long operationEndTime = 0;
-int activePump = -1;
-int activeValve = -1;
-bool operationInProgress = false;
+// 每个气囊独立状态：可多气囊同时充气/放气；同一气囊重复命令仅重置该气囊计时（非阻塞）
+enum AirbagAction { ACTION_IDLE = 0, ACTION_INFLATE = 1, ACTION_DEFLATE = 2 };
+
+AirbagAction airbagAction[4] = { ACTION_IDLE, ACTION_IDLE, ACTION_IDLE, ACTION_IDLE };
+unsigned long airbagEndTime[4] = { 0, 0, 0, 0 };
 
 void setup() {
-  // 初始化串口
   Serial.begin(9600);
-  
-  // 初始化所有引脚为输出，并设置为低电平（关闭状态）
   for (int i = 0; i < 4; i++) {
     pinMode(PUMP_PINS[i], OUTPUT);
     pinMode(VALVE_PINS[i], OUTPUT);
     digitalWrite(PUMP_PINS[i], LOW);
     digitalWrite(VALVE_PINS[i], LOW);
   }
-  
   Serial.println("Airbag Controller Ready");
   Serial.println("Commands: P<n><t> (inflate), V<n><t> (deflate), S (stop)");
-  Serial.println("n=1-4 (airbag), t=1(5s/10s) or 2(10s/15s)");
+  Serial.println("Per-airbag timing; same airbag resets timer only.");
 }
 
 void loop() {
-  // 检查是否有操作需要结束
-  if (operationInProgress && millis() >= operationEndTime) {
-    stopAllOperations();
-    Serial.println("OK:Operation completed");
-  }
-  
-  // 处理串口命令
-  if (Serial.available() >= 3) {
-    char cmd = Serial.read();
-    char airbagChar = Serial.read();
-    char durationChar = Serial.read();
-    
-    // 清除串口缓冲区中的多余字符（如换行符）
-    while (Serial.available() > 0) {
-      Serial.read();
+  unsigned long now = millis();
+  for (int i = 0; i < 4; i++) {
+    if (airbagAction[i] != ACTION_IDLE && now >= airbagEndTime[i]) {
+      stopAirbag(i + 1);
     }
-    
-    int airbag = airbagChar - '0';
-    int level = durationChar - '0';
-    
-    // 停止命令优先处理（兼容 S00 等，后两字节忽略）
+  }
+
+  // 至少需要 3 字节才尝试解析（P/V/S + 两位数字）
+  if (Serial.available() < 3) return;
+
+  // 首字节必须是 P/V/S；否则只丢弃这 1 字节并 return，避免一次吞掉多字节导致整条命令丢失（如 "11p" 被读光后无法解析）
+  char cmd = Serial.read();
+  if (cmd != 'P' && cmd != 'p' && cmd != 'V' && cmd != 'v' && cmd != 'S' && cmd != 's') return;
+
+  // 取第二个逻辑字符：气囊号 1-4，跳过空格/换行
+  char airbagChar = 0;
+  while (Serial.available() > 0) {
+    airbagChar = Serial.read();
+    if (airbagChar >= '1' && airbagChar <= '4') break;
+  }
+  if (airbagChar < '1' || airbagChar > '4') {
     if (cmd == 'S' || cmd == 's') {
+      Serial.println("RX:S");
       stopAllOperations();
       Serial.println("OK:All operations stopped");
-      return;
+      while (Serial.available() > 0) {
+        char c = Serial.peek();
+        if (c != ' ' && c != '\r' && c != '\n') break;
+        Serial.read();
+      }
     }
-    
-    // 验证参数
-    if (airbag < 1 || airbag > 4) {
-      Serial.println("ERR:Invalid airbag number (1-4)");
-      return;
+    return;
+  }
+
+  // S 命令：不需要两位数字，有 S 就停
+  if (cmd == 'S' || cmd == 's') {
+    Serial.println("RX:S");
+    stopAllOperations();
+    Serial.println("OK:All operations stopped");
+    while (Serial.available() > 0) {
+      char c = Serial.peek();
+      if (c != ' ' && c != '\r' && c != '\n') break;
+      Serial.read();
     }
-    
-    if (level != 1 && level != 2) {
-      Serial.println("ERR:Invalid level (1 or 2)");
-      return;
-    }
-    
-    // 执行命令
-    if (cmd == 'P' || cmd == 'p') {
-      // 充气命令
-      startInflate(airbag, level);
-    } else if (cmd == 'V' || cmd == 'v') {
-      // 放气命令
-      startDeflate(airbag, level);
-    } else {
-      Serial.println("ERR:Unknown command");
-    }
+    return;
+  }
+
+  // 取第三个逻辑字符：档位 1-2，跳过空格/换行
+  char durationChar = 0;
+  while (Serial.available() > 0) {
+    durationChar = Serial.read();
+    if (durationChar == '1' || durationChar == '2') break;
+  }
+  // 只丢弃空白，避免把下一条命令的开头（如 p11）一起清掉导致后续再也凑不齐 3 字节
+  while (Serial.available() > 0) {
+    char c = Serial.peek();
+    if (c != ' ' && c != '\r' && c != '\n') break;
+    Serial.read();
+  }
+
+  int airbag = airbagChar - '0';
+  int level = durationChar == '2' ? 2 : 1;  // 未收到有效档位时视为 1
+  if (level != 1 && level != 2) {
+    Serial.println("ERR:Invalid level (1 or 2)");
+    return;
+  }
+
+  // 回显收到的命令
+  Serial.print("RX:");
+  Serial.print((char)cmd);
+  Serial.print(airbag);
+  Serial.println(level);
+  if (cmd == 'P' || cmd == 'p') {
+    startInflate(airbag, level);
+  } else {
+    startDeflate(airbag, level);
   }
 }
 
 void startInflate(int airbag, int level) {
-  // 先停止所有操作
-  stopAllOperations();
-  
-  int pumpIndex = airbag - 1;
-  int timeIndex = level - 1;
-  unsigned long duration = INFLATE_TIMES[timeIndex];
-  
-  // 开启对应的充气泵
-  digitalWrite(PUMP_PINS[pumpIndex], HIGH);
-  activePump = pumpIndex;
-  
-  // 设置结束时间
-  operationEndTime = millis() + duration;
-  operationInProgress = true;
-  
+  int idx = airbag - 1;
+  unsigned long duration = INFLATE_TIMES[level - 1];
+  digitalWrite(VALVE_PINS[idx], LOW);
+  digitalWrite(PUMP_PINS[idx], HIGH);
+  airbagAction[idx] = ACTION_INFLATE;
+  airbagEndTime[idx] = millis() + duration;
   Serial.print("OK:Inflating airbag ");
   Serial.print(airbag);
   Serial.print(" for ");
@@ -130,21 +145,12 @@ void startInflate(int airbag, int level) {
 }
 
 void startDeflate(int airbag, int level) {
-  // 先停止所有操作
-  stopAllOperations();
-  
-  int valveIndex = airbag - 1;
-  int timeIndex = level - 1;
-  unsigned long duration = DEFLATE_TIMES[timeIndex];
-  
-  // 开启对应的放气阀
-  digitalWrite(VALVE_PINS[valveIndex], HIGH);
-  activeValve = valveIndex;
-  
-  // 设置结束时间
-  operationEndTime = millis() + duration;
-  operationInProgress = true;
-  
+  int idx = airbag - 1;
+  unsigned long duration = DEFLATE_TIMES[level - 1];
+  digitalWrite(PUMP_PINS[idx], LOW);
+  digitalWrite(VALVE_PINS[idx], HIGH);
+  airbagAction[idx] = ACTION_DEFLATE;
+  airbagEndTime[idx] = millis() + duration;
   Serial.print("OK:Deflating airbag ");
   Serial.print(airbag);
   Serial.print(" for ");
@@ -152,14 +158,29 @@ void startDeflate(int airbag, int level) {
   Serial.println(" seconds");
 }
 
+void stopAirbag(int airbag) {
+  int idx = airbag - 1;
+  if (idx < 0 || idx > 3) return;
+  if (airbagAction[idx] == ACTION_INFLATE) {
+    Serial.print("OK:Airbag ");
+    Serial.print(airbag);
+    Serial.println(" finished inflating");
+  } else if (airbagAction[idx] == ACTION_DEFLATE) {
+    Serial.print("OK:Airbag ");
+    Serial.print(airbag);
+    Serial.println(" finished deflating");
+  }
+  digitalWrite(PUMP_PINS[idx], LOW);
+  digitalWrite(VALVE_PINS[idx], LOW);
+  airbagAction[idx] = ACTION_IDLE;
+  airbagEndTime[idx] = 0;
+}
+
 void stopAllOperations() {
-  // 关闭所有泵和阀
   for (int i = 0; i < 4; i++) {
     digitalWrite(PUMP_PINS[i], LOW);
     digitalWrite(VALVE_PINS[i], LOW);
+    airbagAction[i] = ACTION_IDLE;
+    airbagEndTime[i] = 0;
   }
-  
-  activePump = -1;
-  activeValve = -1;
-  operationInProgress = false;
 }
